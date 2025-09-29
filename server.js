@@ -43,7 +43,7 @@ app.get('/api/search', async (req, res) => {
                 Limit: allowedLimit,
                 SortType: 'Relevance'
             },
-            timeout: 10000 // 10 second timeout
+            timeout: 10000
         });
 
         if (!response.data.data) {
@@ -131,7 +131,7 @@ app.get('/api/popular', async (req, res) => {
             `https://catalog.roblox.com/v1/search/items/details`, {
             params: {
                 Category: 'All',
-                Limit: 30, // Fixed to allowed value
+                Limit: 30,
                 SortType: 'Popular'
             },
             timeout: 10000
@@ -162,62 +162,11 @@ app.get('/api/popular', async (req, res) => {
     }
 });
 
-// Get items by category
-app.get('/api/category/:category', async (req, res) => {
-    try {
-        const { category } = req.params;
-        const { limit = 30 } = req.query;
-        
-        console.log('📂 Getting items for category:', category);
-        
-        await delay(100);
-        
-        // Roblox API only allows specific limit values: 10, 28, or 30
-        let allowedLimit = 30;
-        const requestedLimit = parseInt(limit);
-        if ([10, 28, 30].includes(requestedLimit)) {
-            allowedLimit = requestedLimit;
-        }
-        
-        const response = await axios.get(
-            `https://catalog.roblox.com/v1/search/items/details`, {
-            params: {
-                Category: category,
-                Limit: allowedLimit,
-                SortType: 'Popular'
-            },
-            timeout: 10000
-        });
-
-        if (!response.data.data) {
-            return res.json([]);
-        }
-        
-        const formattedResults = response.data.data.map(item => ({
-            assetId: item.id,
-            name: item.name,
-            price: item.price || 0,
-            description: item.description
-        }));
-
-        console.log(`✅ Found ${formattedResults.length} items in ${category}`);
-        
-        res.json(formattedResults);
-        
-    } catch (error) {
-        console.error('❌ Category error:', error);
-        res.status(500).json({ 
-            error: 'Failed to get category items',
-            details: error.message 
-        });
-    }
-});
-
 // Health check endpoint
 app.get('/health', (req, res) => {
     res.json({ 
         status: '✅ OK',
-        message: 'Roblox Catalog Proxy is running!',
+        message: 'Roblox Catalog Proxy is running on Render!',
         timestamp: new Date().toISOString()
     });
 });
@@ -227,19 +176,18 @@ app.get('/', (req, res) => {
     res.json({ 
         message: '🎮 Roblox Catalog Proxy Server',
         version: '1.0.0',
+        deployed: 'Render.com',
         endpoints: {
             search: 'GET /api/search?query=YOUR_QUERY&limit=30',
             itemDetails: 'GET /api/item/:assetId',
             popular: 'GET /api/popular',
-            category: 'GET /api/category/:category',
             health: 'GET /health'
         },
         examples: {
-            search: 'http://localhost:3000/api/search?query=hat&limit=30',
-            itemDetails: 'http://localhost:3000/api/item/102611803',
-            popular: 'http://localhost:3000/api/popular'
-        },
-        note: 'Limit parameter only accepts: 10, 28, or 30'
+            search: '/api/search?query=hat&limit=30',
+            itemDetails: '/api/item/102611803',
+            popular: '/api/popular'
+        }
     });
 });
 
@@ -258,16 +206,7 @@ app.use((req, res) => {
 
 // Start server
 app.listen(PORT, () => {
-    console.log(`\n🚀 Roblox Catalog Proxy Server started!`);
-    console.log(`📡 Local: http://localhost:${PORT}`);
-    console.log(`🌐 Network: http://YOUR_IP:${PORT}`);
-    console.log(`\n📚 Available endpoints:`);
-    console.log(`   🔍 Search: http://localhost:${PORT}/api/search?query=hat&limit=30`);
-    console.log(`   📦 Item Details: http://localhost:${PORT}/api/item/102611803`);
-    console.log(`   🔥 Popular: http://localhost:${PORT}/api/popular`);
-    console.log(`   ❤️  Health: http://localhost:${PORT}/health`);
-    console.log(`\n💡 Tip: Test the server by visiting the links above in your browser!`);
-    console.log(`📝 Note: Limit parameter only accepts: 10, 28, or 30\n`);
+    console.log(`🚀 Roblox Catalog Proxy Server running on port ${PORT}`);
 });
 
 module.exports = app;
