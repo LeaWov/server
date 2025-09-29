@@ -5,106 +5,97 @@ const cors = require('cors');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware
 app.use(cors());
 app.use(express.json());
 
-// Rate limiting variables
-let requestCount = 0;
-let lastResetTime = Date.now();
-const MAX_REQUESTS_PER_MINUTE = 10;
+// Cache system
+const searchCache = new Map();
+const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
 
-// Helper function to delay requests
-const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
-// Rate limiting middleware
-app.use((req, res, next) => {
-    const now = Date.now();
-    const timePassed = now - lastResetTime;
-    
-    if (timePassed > 60000) {
-        requestCount = 0;
-        lastResetTime = now;
-    }
-    
-    if (requestCount >= MAX_REQUESTS_PER_MINUTE) {
-        const waitTime = 60000 - timePassed;
-        console.log(`⏳ Rate limit exceeded. Waiting ${Math.ceil(waitTime/1000)} seconds...`);
-        return res.status(429).json({
-            error: 'Rate limit exceeded',
-            message: 'Too many requests to Roblox API. Please try again in a minute.',
-            retryAfter: Math.ceil(waitTime/1000)
-        });
-    }
-    
-    requestCount++;
-    next();
-});
-
-// Search Roblox catalog
+// Search with categories
 app.get('/api/search', async (req, res) => {
     try {
-        const { query, category = 'All', limit = 30 } = req.query;
+        const { query, category = 'All', sort = 'Relevance', limit = 30 } = req.query;
         
-        if (!query || query.trim() === '') {
-            return res.status(400).json({ 
-                error: 'Search query is required' 
-            });
+        // Check cache first
+        const cacheKey = `${query}-${category}-${sort}-${limit}`.toLowerCase();
+        const cached = searchCache.get(cacheKey);
+        
+        if (cached && Date.now() - cached.timestamp < CACHE_DURATION) {
+            console.log(`📦 Serving from cache: ${query}`);
+            return res.json(cached.data);
         }
 
-        console.log('🔍 Searching Roblox catalog for:', query, `(Request ${requestCount}/${MAX_REQUESTS_PER_MINUTE})`);
+        console.log('🔍 Searching:', query, 'Category:', category, 'Sort:', sort);
         
-        await delay(2000);
-        
-        let allowedLimit = 30;
-        const requestedLimit = parseInt(limit);
-        if ([10, 28, 30].includes(requestedLimit)) {
-            allowedLimit = requestedLimit;
-        }
+        // Wait 3 seconds between requests to avoid rate limits
+        await new Promise(resolve => setTimeout(resolve, 3000));
         
         const response = await axios.get(
             `https://catalog.roblox.com/v1/search/items/details`, {
             params: {
-                Keyword: query.trim(),
+                Keyword: query || '',
                 Category: category,
-                Limit: allowedLimit,
-                SortType: 'Relevance'
+                Limit: 30, // Roblox only allows 10, 28, or 30
+                SortType: sort
             },
-            timeout: 15000,
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
+            timeout: 15000
         });
 
         if (!response.data.data) {
             return res.json([]);
         }
         
-        const formattedResults = response.data.data.map(item => ({
-            assetId: item.id,
-            name: item.name,
-            price: item.price || 0,
-            description: item.description,
-            productId: item.productId,
-            assetTypeId: item.assetTypeId,
-            creator: item.creatorName,
-            isForSale: item.isForSale || false
-        }));
+        // Get accurate prices for each item
+        const itemsWithAccuratePrices = await Promise.all(
+            response.data.data.map(async (item) => {
+                try {
+                    // Get detailed product info for accurate pricing
+                    const productResponse = await axios.get(
+                        `https://economy.roblox.com/v2/assets/${item.id}/details`,
+                        { timeout: 10000 }
+                    );
+                    
+                    return {
+                        assetId: item.id,
+                        name: item.name,
+                        price: productResponse.data.PriceInRobux || item.price || 0,
+                        description: item.description,
+                        productId: item.productId,
+                        assetTypeId: item.assetTypeId,
+                        creator: item.creatorName,
+                        isForSale: item.isForSale || false,
+                        itemType: getItemType(item.assetTypeId)
+                    };
+                } catch (error) {
+                    // Fallback to basic info if detailed request fails
+                    return {
+                        assetId: item.id,
+                        name: item.name,
+                        price: item.price || 0,
+                        description: item.description,
+                        productId: item.productId,
+                        assetTypeId: item.assetTypeId,
+                        creator: item.creatorName,
+                        isForSale: item.isForSale || false,
+                        itemType: getItemType(item.assetTypeId)
+                    };
+                }
+            })
+        );
 
-        console.log(`✅ Found ${formattedResults.length} items for "${query}"`);
+        // Cache the results
+        searchCache.set(cacheKey, {
+            data: itemsWithAccuratePrices,
+            timestamp: Date.now()
+        });
+
+        console.log(`✅ Found ${itemsWithAccuratePrices.length} items`);
         
-        res.json(formattedResults);
+        res.json(itemsWithAccuratePrices);
         
     } catch (error) {
-        console.error('❌ Search error:', error.response?.status, error.response?.data || error.message);
-        
-        if (error.response?.status === 429) {
-            return res.status(429).json({ 
-                error: 'Roblox API rate limit exceeded',
-                message: 'The Roblox API is temporarily rate limiting us. Please wait a minute and try again.'
-            });
-        }
-        
+        console.error('❌ Search error:', error.response?.data || error.message);
         res.status(500).json({ 
             error: 'Failed to search catalog',
             details: error.message 
@@ -112,132 +103,36 @@ app.get('/api/search', async (req, res) => {
     }
 });
 
-// Get item details by asset ID - FIXED ENDPOINT
-app.get('/api/item/:assetId', async (req, res) => {
+// Get item type from assetTypeId
+function getItemType(assetTypeId) {
+    const types = {
+        2: 'TShirt',
+        11: 'Shirt',
+        12: 'Pants',
+        17: 'Head',
+        18: 'Face',
+        19: 'Gear',
+        27: 'Hair',
+        28: 'Hat',
+        29: 'Package',
+        30: 'Bundle'
+    };
+    return types[assetTypeId] || 'Unknown';
+}
+
+// Get popular items by category
+app.get('/api/popular/:category', async (req, res) => {
     try {
-        const { assetId } = req.params;
-        
-        if (!assetId || isNaN(assetId)) {
-            return res.status(400).json({ 
-                error: 'Valid asset ID is required' 
-            });
-        }
-
-        console.log('📦 Getting details for asset ID:', assetId, `(Request ${requestCount}/${MAX_REQUESTS_PER_MINUTE})`);
-        
-        await delay(2000);
-        
-        // Use the correct Roblox API endpoint for product info
-        const response = await axios.get(
-            `https://economy.roblox.com/v2/assets/${assetId}/details`,
-            { 
-                timeout: 15000,
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                }
-            }
-        );
-        
-        // Format the response
-        const itemData = response.data;
-        const formattedItem = {
-            assetId: itemData.AssetId,
-            name: itemData.Name,
-            price: itemData.PriceInRobux || 0,
-            description: itemData.Description,
-            productId: itemData.ProductId,
-            creator: itemData.Creator?.Name || 'Unknown',
-            isForSale: itemData.IsForSale || false,
-            assetTypeId: itemData.AssetTypeId
-        };
-        
-        res.json(formattedItem);
-        
-    } catch (error) {
-        console.error('❌ Item details error:', error.response?.status, error.response?.data || error.message);
-        
-        if (error.response?.status === 429) {
-            return res.status(429).json({ 
-                error: 'Roblox API rate limit exceeded',
-                message: 'The Roblox API is temporarily rate limiting us. Please wait a minute and try again.'
-            });
-        }
-        
-        if (error.response?.status === 400) {
-            return res.status(404).json({ 
-                error: 'Item not found or invalid asset ID',
-                message: 'The item you\'re looking for doesn\'t exist or the asset ID is invalid.'
-            });
-        }
-        
-        if (error.response?.status === 404) {
-            return res.status(404).json({ 
-                error: 'Item not found' 
-            });
-        }
-        
-        res.status(500).json({ 
-            error: 'Failed to get item details',
-            details: error.message 
-        });
-    }
-});
-
-// Alternative item details endpoint (using catalog API)
-app.get('/api/item-catalog/:assetId', async (req, res) => {
-    try {
-        const { assetId } = req.params;
-        
-        if (!assetId || isNaN(assetId)) {
-            return res.status(400).json({ 
-                error: 'Valid asset ID is required' 
-            });
-        }
-
-        console.log('📦 Getting catalog details for asset ID:', assetId);
-        
-        await delay(2000);
-        
-        // Alternative endpoint using catalog API
-        const response = await axios.get(
-            `https://catalog.roblox.com/v1/catalog/items/${assetId}/details`,
-            { 
-                timeout: 15000,
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                }
-            }
-        );
-        
-        res.json(response.data);
-        
-    } catch (error) {
-        console.error('❌ Catalog item details error:', error.response?.status, error.response?.data || error.message);
-        res.status(500).json({ 
-            error: 'Failed to get catalog item details',
-            details: error.message 
-        });
-    }
-});
-
-// Get popular items
-app.get('/api/popular', async (req, res) => {
-    try {
-        console.log('🔥 Getting popular items...', `(Request ${requestCount}/${MAX_REQUESTS_PER_MINUTE})`);
-        
-        await delay(2000);
+        const { category } = req.params;
         
         const response = await axios.get(
             `https://catalog.roblox.com/v1/search/items/details`, {
             params: {
-                Category: 'All',
+                Category: category,
                 Limit: 30,
                 SortType: 'Popular'
             },
-            timeout: 15000,
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
+            timeout: 15000
         });
 
         if (!response.data.data) {
@@ -249,81 +144,27 @@ app.get('/api/popular', async (req, res) => {
             name: item.name,
             price: item.price || 0,
             description: item.description,
-            creator: item.creatorName
+            creator: item.creatorName,
+            itemType: getItemType(item.assetTypeId)
         }));
 
-        console.log(`✅ Found ${formattedResults.length} popular items`);
-        
         res.json(formattedResults);
         
     } catch (error) {
-        console.error('❌ Popular items error:', error.response?.status, error.response?.data || error.message);
-        
-        if (error.response?.status === 429) {
-            return res.status(429).json({ 
-                error: 'Roblox API rate limit exceeded',
-                message: 'The Roblox API is temporarily rate limiting us. Please wait a minute and try again.'
-            });
-        }
-        
-        res.status(500).json({ 
-            error: 'Failed to get popular items',
-            details: error.message 
-        });
+        console.error('❌ Popular items error:', error);
+        res.status(500).json({ error: 'Failed to get popular items' });
     }
 });
 
-// Health check endpoint
+// Health check
 app.get('/health', (req, res) => {
     res.json({ 
         status: '✅ OK',
-        message: 'Roblox Catalog Proxy is running on Render!',
-        rateLimit: `${requestCount}/${MAX_REQUESTS_PER_MINUTE} requests this minute`,
+        message: 'Enhanced Catalog Proxy is running!',
         timestamp: new Date().toISOString()
     });
 });
 
-// Root endpoint
-app.get('/', (req, res) => {
-    res.json({ 
-        message: '🎮 Roblox Catalog Proxy Server',
-        version: '2.0.0',
-        deployed: 'Render.com',
-        rateLimit: '10 requests per minute to avoid Roblox API limits',
-        endpoints: {
-            search: 'GET /api/search?query=YOUR_QUERY&limit=30',
-            itemDetails: 'GET /api/item/:assetId',
-            itemCatalog: 'GET /api/item-catalog/:assetId (alternative)',
-            popular: 'GET /api/popular',
-            health: 'GET /health'
-        },
-        examples: {
-            search: '/api/search?query=hat&limit=30',
-            itemDetails: '/api/item/102611803 (Classic T-Shirt)',
-            itemCatalog: '/api/item-catalog/102611803',
-            popular: '/api/popular'
-        }
-    });
-});
-
-// 404 handler
-app.use((req, res) => {
-    res.status(404).json({ 
-        error: 'Endpoint not found',
-        availableEndpoints: {
-            search: '/api/search?query=YOUR_QUERY&limit=30',
-            itemDetails: '/api/item/:assetId',
-            popular: '/api/popular',
-            health: '/health'
-        }
-    });
-});
-
-// Start server
 app.listen(PORT, () => {
-    console.log(`🚀 Roblox Catalog Proxy Server running on port ${PORT}`);
-    console.log(`📊 Rate limit: ${MAX_REQUESTS_PER_MINUTE} requests per minute`);
-    console.log(`✅ Fixed item details endpoint using economy API`);
+    console.log(`🚀 Enhanced Catalog Proxy running on port ${PORT}`);
 });
-
-module.exports = app;
